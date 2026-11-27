@@ -27,4 +27,5 @@ jobs:
       - name: 啟動機構級盯盤雷達
         env:
           FUGLE_API_KEY: ${{ secrets.FUGLE_API_KEY }}
-          NTFY_TOPIC: ${{
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python stock_radar.py
