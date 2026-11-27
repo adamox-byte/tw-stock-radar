@@ -41,8 +41,10 @@ jobs:
 
           TW_TZ = ZoneInfo("Asia/Taipei")
 
-          NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "my_tw_stock_k82m")
-          FUGLE_API_KEY = os.environ.get("FUGLE_API_KEY", "")
+          # 雙重防呆：若環境變數為空或空格，強制綁定你的專屬頻道
+          env_topic = os.environ.get("NTFY_TOPIC", "").strip()
+          NTFY_TOPIC = env_topic if env_topic else "my_tw_stock_k82m"
+          FUGLE_API_KEY = os.environ.get("FUGLE_API_KEY", "").strip()
 
           watchlist = [
               ("2606", "裕民", 68.0),
@@ -74,9 +76,8 @@ jobs:
                   f"時間: {datetime.now(TW_TZ).strftime('%H:%M:%S')}"
               )
               try:
-                  # 官方標準 JSON 傳輸 (100% 支援中文與 Emoji)
                   resp = requests.post(
-                      "https://ntfy.sh",
+                      "https://ntfy.sh/",
                       json={
                           "topic": NTFY_TOPIC,
                           "title": title,
@@ -86,15 +87,15 @@ jobs:
                       },
                       timeout=5
                   )
-                  print(f"\n  >>> 🚀 【手機推播已送出】HTTP {resp.status_code}：{name} 築底真突破！")
+                  print(f"\n  >>> 🚀 【手機推播已響鈴】HTTP {resp.status_code}：{name} 築底真突破！")
               except Exception as e:
                   print(f"\n  >>> ⚠️ 推播失敗: {e}")
 
           def main():
-              # 啟動時發送「連線測試推播」
+              # 啟動時發送連線測試
               try:
                   resp = requests.post(
-                      "https://ntfy.sh",
+                      "https://ntfy.sh/",
                       json={
                           "topic": NTFY_TOPIC,
                           "title": "⚡ GitHub Actions 雲端上線",
@@ -104,14 +105,14 @@ jobs:
                       },
                       timeout=5
                   )
-                  print(f"📡 開機推播發送狀態: HTTP {resp.status_code}")
+                  print(f"📡 開機推播狀態: HTTP {resp.status_code} | 目標頻道: {NTFY_TOPIC}")
               except Exception as e:
                   print(f"⚠️ 開機推播異常: {e}")
 
               now_tw = datetime.now(TW_TZ)
-              # 週末休市判定防呆
+              # 週末休市防呆 (週六、週日自動結束)
               if now_tw.weekday() >= 5:
-                  print(f"[{now_tw.strftime('%Y-%m-%d %H:%M:%S')}] ⏸️ 今日為週末休市，測試推播已發送，程式自動結束！")
+                  print(f"[{now_tw.strftime('%Y-%m-%d %H:%M:%S')}] ⏸️ 週末休市，測試完畢自動關機。")
                   return
 
               client = RestClient(api_key=FUGLE_API_KEY)
