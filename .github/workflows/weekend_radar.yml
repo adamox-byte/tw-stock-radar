@@ -76,7 +76,7 @@ jobs:
                       time.sleep(65)
                   raise
 
-          def send_ntfy(title: str, body: str, priority: int = 3, tags=None):
+          def send_ntfy(title: str, body: str, priority: int = 4, tags=None):
               lines = body.splitlines()
               chunks, buf, buf_bytes = [], [], 0
               for line in lines:
@@ -133,7 +133,7 @@ jobs:
 
           def main():
               if not FUGLE_API_KEY:
-                  send_ntfy("❌ 週末戰情腳本異常", "未偵測到 FUGLE_API_KEY，請檢查 GitHub Secrets！", priority=4, tags=["warning"])
+                  send_ntfy("❌ 週末戰情腳本異常", "未偵測到 FUGLE_API_KEY，請檢查 GitHub Secrets！", priority=5, tags=["warning"])
                   raise ValueError("❌ 未設定 FUGLE_API_KEY")
 
               now_tw = datetime.now(TW_TZ)
@@ -147,15 +147,15 @@ jobs:
 
               attention_set, disposition_set = get_risk_sets(stock_api)
               risk_lines = []
-              stock_lines = []
+              over_res = []
+              near_res = []
+              far_res = []
 
               for code, name_cfg, res_p in watchlist:
                   try:
                       stats = safe_call(stock_api.historical.stats, symbol=code)
                       name = stats.get("name") or name_cfg
                       close_p = stats.get("closePrice")
-                      chg_pct = stats.get("changePercent")
-                      high_52w = stats.get("week52High")
                       val_yi = (stats.get("tradeValue") or 0) / 1e8
 
                       candles = safe_call(
@@ -174,9 +174,19 @@ jobs:
 
                       q = safe_call(stock_api.intraday.quote, symbol=code)
                       q_date = q.get("date", "")
+                      q_valid = bool(q_date and (not latest_day or q_date == latest_day))
+
                       vwap = None
                       outer_pct = None
-                      if q_date and (not latest_day or q_date == latest_day):
+                      chg_pct = q.get("changePercent") if q_valid else None
+                      if chg_pct is None:
+                          chg_pct = stats.get("changePercent")
+                      if chg_pct is None and len(valid_days) >= 2:
+                          prev_c = valid_days[1].get("close")
+                          if close_p is not None and prev_c:
+                              chg_pct = ((close_p - prev_c) / prev_c) * 100
+
+                      if q_valid:
                           vwap = q.get("avgPrice")
                           total = q.get("total") or {}
                           ask_v = float(total.get("tradeVolumeAtAsk") or 0)
@@ -193,36 +203,68 @@ jobs:
                           risk_lines.append(f"⚠️ {code} {name}（注意股）")
 
                       chg_str = f"{chg_pct:+.2f}%" if chg_pct is not None else "NA"
-                      ma5_str = ("✅5MA" if close_p >= ma5 else "❌破5MA") if (close_p and ma5) else "NA"
-                      vwap_str = ("✅VWAP" if close_p >= vwap else "❌破VWAP") if (close_p and vwap) else "NA"
-                      out_str = f"{outer_pct:.1f}%" if outer_pct is not None else "NA"
-                      dist_res = ((res_p - close_p) / close_p * 100) if (close_p and res_p) else None
-                      res_str = f"{res_p}({dist_res:+.1f}%)" if dist_res is not None else f"{res_p}"
-                      h10_str = f"{high_10d}" if high_10d is not None else "NA"
-                      h52_str = f"{high_52w}" if high_52w is not None else "NA"
+                      ma5_str = (f"站5MA({ma5:.1f})" if close_p >= ma5 else f"破5MA({ma5:.1f})") if (close_p and ma5) else "5MA:NA"
+                      vwap_str = ("站VWAP" if close_p >= vwap else "破VWAP") if (close_p and vwap) else "VWAP:NA"
 
-                      line = (
-                          f"• {code} {name}{flag}：收 {close_p} ({chg_str}) | {val_yi:.1f}億\n"
-                          f"  位階：{ma5_str} / {vwap_str} | 外盤：{out_str}\n"
-                          f"  參考：設頂 {res_str} | 10日高 {h10_str} | 52W高 {h52_str}"
-                      )
-                      stock_lines.append(line)
+                      if outer_pct is None:
+                          out_badge = "外盤:NA"
+                      elif outer_pct >= 60:
+                          out_badge = f"🔥外盤{outer_pct:.1f}%偏多"
+                      elif outer_pct <= 40:
+                          out_badge = f"❄️外盤{outer_pct:.1f}%偏弱"
+                      else:
+                          out_badge = f"外盤{outer_pct:.1f}%"
+
+                      h10_str = f"{high_10d}" if high_10d is not None else "NA"
+                      dist_res = ((res_p - close_p) / close_p * 100) if (close_p and res_p) else None
+
+                      if dist_res is not None and dist_res <= 0:
+                          block = (
+                              f"• {code} {name}{flag}：收 {close_p} ({chg_str}) | {val_yi:.1f}億\n"
+                              f"  👉 已超過舊頂 {res_p}！建議改看 10日高 {h10_str}\n"
+                              f"  👉 {ma5_str} | {vwap_str} | {out_badge}"
+                          )
+                          over_res.append(block)
+                      elif dist_res is not None and dist_res <= 5.0:
+                          block = (
+                              f"• {code} {name}{flag}：收 {close_p} ({chg_str}) | {val_yi:.1f}億\n"
+                              f"  👉 離頂 {res_p} 只差 +{dist_res:.1f}% ({out_badge})\n"
+                              f"  👉 {ma5_str} | {vwap_str} | 10日高 {h10_str}"
+                          )
+                          near_res.append((dist_res, block))
+                      else:
+                          dist_txt = f"距頂+{dist_res:.1f}%" if dist_res is not None else "距頂:NA"
+                          far_res.append(f"• {code} {name}{flag} {close_p} ({chg_str}) | {dist_txt} | {out_badge}")
+
                       print(f"✅ 完成 {code} {name} (資料日: {latest_day or q_date})")
 
                   except FugleAPIError as e:
                       print(f"⚠️ [{code}] API 錯誤 ({e.status_code}): {e.response_text}")
-                      stock_lines.append(f"• {code} {name_cfg}：API 錯誤 ({e.status_code})")
+                      far_res.append(f"• {code} {name_cfg}：API 錯誤 ({e.status_code})")
                   except Exception as e:
                       print(f"⚠️ [{code}] 例外錯誤: {e}")
-                      stock_lines.append(f"• {code} {name_cfg}：讀取異常")
+                      far_res.append(f"• {code} {name_cfg}：讀取異常")
 
-              risk_header = "【⚠️ 掃雷提醒】\n" + "\n".join(risk_lines) if risk_lines else "【✅ 掃雷完成】名單內目前無注意/處置股"
-              body = f"資料基準：{now_str} TW（42%低載模式）\n\n{risk_header}\n\n【📊 自選股週報與週一箱頂參考】\n" + "\n".join(stock_lines)
+              near_res.sort(key=lambda x: x[0])
 
+              sections = [f"資料基準：{now_str} TW\n"]
+              if risk_lines:
+                  sections.append("【⚠️ 掃雷提醒】\n" + "\n".join(risk_lines) + "\n")
+              else:
+                  sections.append("【✅ 掃雷完成】無注意/處置股\n")
+
+              if over_res:
+                  sections.append("【⚠️ 舊頂已過時！週一記得調高】\n" + "\n".join(over_res) + "\n")
+              if near_res:
+                  sections.append("【🔥 準備撞頂！距設定頂 ≤ 5%】\n" + "\n".join(b for _, b in near_res) + "\n")
+              if far_res:
+                  sections.append("【💤 離頂較遠 (>5%)】\n" + "\n".join(far_res))
+
+              # priority=4 為高優先；若想連手機「勿擾模式」都響鈴可改成 5
               send_ntfy(
-                  title="📋 台股戰情週報與週一備戰",
-                  body=body,
-                  priority=4 if risk_lines else 3,
+                  title="📋 週一備戰地圖",
+                  body="\n".join(sections),
+                  priority=4,
                   tags=["clipboard", "chart_with_upwards_trend"],
               )
 
