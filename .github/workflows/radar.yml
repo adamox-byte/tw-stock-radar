@@ -16,16 +16,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 安裝 Python 環境
-        uses: setup-python@v5
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: 安裝富果與網路套件
         run: |
-          pip install fugle-marketdata requests
+          pip install fugle-marketdata requests tzdata
 
       - name: 啟動機構級盯盤雷達
         env:
           FUGLE_API_KEY: ${{ secrets.FUGLE_API_KEY }}
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: python stock_radar.py
+          NTFY_TOPIC: ${{
