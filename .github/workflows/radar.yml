@@ -74,30 +74,45 @@ jobs:
                   f"時間: {datetime.now(TW_TZ).strftime('%H:%M:%S')}"
               )
               try:
-                  requests.post(
-                      f"https://ntfy.sh/{NTFY_TOPIC}",
-                      data=body.encode("utf-8"),
-                      headers={
-                          "Title": title.encode("utf-8"),
-                          "Priority": "urgent",
-                          "Tags": "dart,chart_with_upwards_trend,moneybag",
+                  # 官方標準 JSON 傳輸 (100% 支援中文與 Emoji)
+                  resp = requests.post(
+                      "https://ntfy.sh",
+                      json={
+                          "topic": NTFY_TOPIC,
+                          "title": title,
+                          "message": body,
+                          "priority": 5,
+                          "tags": ["dart", "chart_with_upwards_trend", "moneybag"]
                       },
                       timeout=5
                   )
-                  print(f"\n  >>> 🚀 【手機推播已響鈴】：{name} 築底真突破！")
+                  print(f"\n  >>> 🚀 【手機推播已送出】HTTP {resp.status_code}：{name} 築底真突破！")
               except Exception as e:
                   print(f"\n  >>> ⚠️ 推播失敗: {e}")
 
           def main():
+              # 啟動時發送「連線測試推播」
               try:
-                  requests.post(
-                      f"https://ntfy.sh/{NTFY_TOPIC}",
-                      data="微軟雲端伺服器已自動開機接管！今日盤中持續獵殺...".encode("utf-8"),
-                      headers={"Title": "⚡ GitHub Actions 雲端上線".encode("utf-8"), "Priority": "default", "Tags": "octocat,rocket"},
+                  resp = requests.post(
+                      "https://ntfy.sh",
+                      json={
+                          "topic": NTFY_TOPIC,
+                          "title": "⚡ GitHub Actions 雲端上線",
+                          "message": "微軟雲端伺服器已開機！推播通道完全暢通，等待獵殺...",
+                          "priority": 3,
+                          "tags": ["octocat", "rocket"]
+                      },
                       timeout=5
                   )
-              except Exception:
-                  pass
+                  print(f"📡 開機推播發送狀態: HTTP {resp.status_code}")
+              except Exception as e:
+                  print(f"⚠️ 開機推播異常: {e}")
+
+              now_tw = datetime.now(TW_TZ)
+              # 週末休市判定防呆
+              if now_tw.weekday() >= 5:
+                  print(f"[{now_tw.strftime('%Y-%m-%d %H:%M:%S')}] ⏸️ 今日為週末休市，測試推播已發送，程式自動結束！")
+                  return
 
               client = RestClient(api_key=FUGLE_API_KEY)
               stock_api = client.stock
