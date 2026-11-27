@@ -9,7 +9,7 @@ on:
 jobs:
   run-radar:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # 允許最長跑 6 小時
+    timeout-minutes: 360
 
     steps:
       - name: 下載專案代碼
@@ -28,4 +28,9 @@ jobs:
         env:
           FUGLE_API_KEY: ${{ secrets.FUGLE_API_KEY }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: python stock_radar.py
+        run: |
+          if [ -f "stock_radar.py" ]; then
+            python -u stock_radar.py
+          else
+            python -u tw-stock-radar/stock_radar.py
+          fi
