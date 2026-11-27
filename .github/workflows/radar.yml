@@ -29,8 +29,6 @@ jobs:
           FUGLE_API_KEY: ${{ secrets.FUGLE_API_KEY }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
-          if [ -f "stock_radar.py" ]; then
-            python -u stock_radar.py
-          else
-            python -u tw-stock-radar/stock_radar.py
-          fi
+          TARGET=$(find . -name "*radar*.py" -print -quit)
+          echo "--> 成功定位檔案: $TARGET"
+          python -u "$TARGET"
