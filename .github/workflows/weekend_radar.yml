@@ -28,7 +28,7 @@ jobs:
         run: |
           pip install fugle-marketdata requests tzdata
 
-      - name: 啟動週末復盤與週一備戰簡報
+      - name: 啟動週末復盤與期望值備戰系統
         env:
           FUGLE_API_KEY: ${{ secrets.FUGLE_API_KEY }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
@@ -37,6 +37,7 @@ jobs:
           import os
           import time
           import requests
+          from collections import defaultdict
           from datetime import datetime, timedelta
           from zoneinfo import ZoneInfo
           from fugle_marketdata import RestClient, FugleAPIError
@@ -131,6 +132,86 @@ jobs:
 
               return attention_set, disposition_set
 
+          def analyze_5m_ev(raw_bars: list) -> dict:
+              """
+              用近 25 天 5分K 回測『站穩VWAP + 突破15分箱頂 + 放量1.8倍』策略期望值
+              固定扣 0.25% 台股當沖稅費；同時算出單分鐘建議爆量門檻(P95)
+              """
+              by_day = defaultdict(list)
+              turnovers_1m = []
+
+              for b in raw_bars:
+                  d_str = b.get("date", "")
+                  o, h, l, c, v = b.get("open"), b.get("high"), b.get("low"), b.get("close"), b.get("volume")
+                  if not d_str or None in (o, h, l, c, v) or v <= 0 or c <= 0:
+                      continue
+                  by_day[d_str[:10]].append(b)
+                  turnovers_1m.append((c * v) / 5.0)
+
+              # 計算建議的單分鐘爆量門檻 (P95，保底 50 萬)
+              p95_1m_wan = None
+              if turnovers_1m:
+                  turnovers_1m.sort()
+                  idx95 = min(len(turnovers_1m) - 1, int(len(turnovers_1m) * 0.95))
+                  p95_1m_wan = max(50.0, turnovers_1m[idx95] / 10_000.0)
+
+              trades = []
+              for day in sorted(by_day.keys()):
+                  bars = sorted(by_day[day], key=lambda x: x["date"])
+                  cum_pv, cum_vol = 0.0, 0.0
+                  in_pos = False
+                  entry_p = 0.0
+
+                  for i, bar in enumerate(bars):
+                      c, h, l, v = bar["close"], bar["high"], bar["low"], bar["volume"]
+                      hhmm = bar["date"][11:16]
+                      cum_pv += c * v
+                      cum_vol += v
+                      vwap = cum_pv / cum_vol if cum_vol > 0 else c
+
+                      if in_pos:
+                          if l <= entry_p * 0.985:
+                              trades.append(-1.5 - 0.25)
+                              break
+                          if h >= entry_p * 1.030:
+                              trades.append(3.0 - 0.25)
+                              break
+                          if hhmm >= "13:25" or i == len(bars) - 1:
+                              raw_pct = ((c - entry_p) / entry_p) * 100.0
+                              trades.append(raw_pct - 0.25)
+                              break
+                          continue
+
+                      if i >= 6 and "09:15" <= hhmm <= "13:00":
+                          box_15m = max(bars[k]["high"] for k in range(i - 3, i))
+                          prev_c = bars[i - 1]["close"]
+                          avg_vol = sum(bars[k]["volume"] for k in range(i - 6, i)) / 6.0
+                          if prev_c <= box_15m and c > box_15m and c >= vwap and v >= avg_vol * 1.8:
+                              in_pos = True
+                              entry_p = c
+
+              if not trades:
+                  return {"count": 0, "ev": None, "win_rate": None, "p95_wan": p95_1m_wan}
+
+              wins = [r for r in trades if r > 0]
+              ev = sum(trades) / len(trades)
+              win_rate = (len(wins) / len(trades)) * 100.0
+              return {"count": len(trades), "ev": ev, "win_rate": win_rate, "p95_wan": p95_1m_wan}
+
+          def is_tight_squeeze(valid_days: list) -> bool:
+              """檢查近 3 日是否窄幅壓縮 (振幅 <= 3%) 且量縮 (最新日量 <= 5日均量 75%)"""
+              if len(valid_days) < 5:
+                  return False
+              vols = [d.get("volume") or 0 for d in valid_days[:5]]
+              avg_v5 = sum(vols) / 5.0
+              if avg_v5 <= 0 or vols[0] > avg_v5 * 0.75:
+                  return False
+              for d in valid_days[:3]:
+                  h, l, c = d.get("high"), d.get("low"), d.get("close")
+                  if not (h and l and c) or ((h - l) / c * 100.0) > 3.2:
+                      return False
+              return True
+
           def main():
               if not FUGLE_API_KEY:
                   send_ntfy("❌ 週末戰情腳本異常", "未偵測到 FUGLE_API_KEY，請檢查 GitHub Secrets！", priority=5, tags=["warning"])
@@ -141,29 +222,30 @@ jobs:
               from_date = (now_tw.date() - timedelta(days=25)).strftime("%Y-%m-%d")
               to_date = now_tw.date().strftime("%Y-%m-%d")
 
-              print(f"🚀 啟動週末/盤後戰情分析 ({now_str} TW)...")
+              print(f"🚀 啟動週末/盤後期望值分析 ({now_str} TW)...")
               client = RestClient(api_key=FUGLE_API_KEY)
               stock_api = client.stock
 
               attention_set, disposition_set = get_risk_sets(stock_api)
               risk_lines = []
-              over_res = []
-              near_res = []
-              far_res = []
+              over_res, near_res, far_res = [], [], []
+              suggested_list = []
 
               for code, name_cfg, res_p in watchlist:
                   try:
+                      # 1. 52週統計
                       stats = safe_call(stock_api.historical.stats, symbol=code)
                       name = stats.get("name") or name_cfg
                       close_p = stats.get("closePrice")
                       val_yi = (stats.get("tradeValue") or 0) / 1e8
 
-                      candles = safe_call(
+                      # 2. 近 25 天日K (算 5MA、10日高、量縮壓縮)
+                      candles_d = safe_call(
                           stock_api.historical.candles,
                           symbol=code,
                           **{"from": from_date, "to": to_date, "timeframe": "D"},
                       )
-                      valid_days = [d for d in candles.get("data", []) if d.get("close") is not None]
+                      valid_days = [d for d in candles_d.get("data", []) if d.get("close") is not None]
                       latest_day = valid_days[0].get("date", "") if valid_days else ""
 
                       if close_p is None and valid_days:
@@ -171,12 +253,22 @@ jobs:
 
                       ma5 = sum(d["close"] for d in valid_days[:5]) / 5 if len(valid_days) >= 5 else None
                       high_10d = max((d["high"] for d in valid_days[:10] if d.get("high") is not None), default=None)
+                      squeeze_tag = " ⚡蓄勢壓縮" if is_tight_squeeze(valid_days) else ""
 
+                      # 3. 近 25 天 5分K (算扣稅後策略期望值 + P95 建議爆量門檻)
+                      candles_5m = safe_call(
+                          stock_api.historical.candles,
+                          symbol=code,
+                          **{"from": from_date, "to": to_date, "timeframe": "5"},
+                      )
+                      ev_info = analyze_5m_ev(candles_5m.get("data", []))
+
+                      # 4. 最新收盤快照 (VWAP + 外盤比 + 漲跌幅)
                       q = safe_call(stock_api.intraday.quote, symbol=code)
                       q_date = q.get("date", "")
                       q_valid = bool(q_date and (not latest_day or q_date == latest_day))
 
-                      vwap = None
+                      vwap = q.get("avgPrice") if q_valid else None
                       outer_pct = None
                       chg_pct = q.get("changePercent") if q_valid else None
                       if chg_pct is None:
@@ -187,7 +279,6 @@ jobs:
                               chg_pct = ((close_p - prev_c) / prev_c) * 100
 
                       if q_valid:
-                          vwap = q.get("avgPrice")
                           total = q.get("total") or {}
                           ask_v = float(total.get("tradeVolumeAtAsk") or 0)
                           bid_v = float(total.get("tradeVolumeAtBid") or 0)
@@ -209,34 +300,51 @@ jobs:
                       if outer_pct is None:
                           out_badge = "外盤:NA"
                       elif outer_pct >= 60:
-                          out_badge = f"🔥外盤{outer_pct:.1f}%偏多"
+                          out_badge = f"🔥外盤{outer_pct:.1f}%"
                       elif outer_pct <= 40:
-                          out_badge = f"❄️外盤{outer_pct:.1f}%偏弱"
+                          out_badge = f"❄️外盤{outer_pct:.1f}%"
                       else:
                           out_badge = f"外盤{outer_pct:.1f}%"
 
+                      if ev_info["ev"] is not None:
+                          ev_icon = "✅" if ev_info["ev"] > 0 else "❌"
+                          ev_str = f"{ev_icon}EV {ev_info['ev']:+.2f}% (勝{ev_info['win_rate']:.0f}%/{ev_info['count']}次)"
+                      else:
+                          ev_str = "EV無樣本"
+
+                      p95_str = f"爆量>{ev_info['p95_wan']:.0f}萬" if ev_info["p95_wan"] else ""
                       h10_str = f"{high_10d}" if high_10d is not None else "NA"
                       dist_res = ((res_p - close_p) / close_p * 100) if (close_p and res_p) else None
 
+                      # 產生建議新 watchlist 值
+                      new_res = res_p
+                      note = ""
+                      if dist_res is not None and dist_res <= 0:
+                          new_res = round(high_10d, 2) if (high_10d and high_10d > close_p) else round(close_p * 1.03, 1)
+                          note = f" #原{res_p}"
+                      suggested_list.append(f'("{code}", "{name}", {new_res}),{note}')
+
                       if dist_res is not None and dist_res <= 0:
                           block = (
-                              f"• {code} {name}{flag}：收 {close_p} ({chg_str}) | {val_yi:.1f}億\n"
-                              f"  👉 已超過舊頂 {res_p}！建議改看 10日高 {h10_str}\n"
+                              f"• {code} {name}{flag}{squeeze_tag}：收 {close_p} ({chg_str}) | {val_yi:.1f}億\n"
+                              f"  👉 已過舊頂 {res_p}！改盯 {new_res} (10日高 {h10_str})\n"
+                              f"  👉 {ev_str} | {p95_str}\n"
                               f"  👉 {ma5_str} | {vwap_str} | {out_badge}"
                           )
                           over_res.append(block)
                       elif dist_res is not None and dist_res <= 5.0:
                           block = (
-                              f"• {code} {name}{flag}：收 {close_p} ({chg_str}) | {val_yi:.1f}億\n"
-                              f"  👉 離頂 {res_p} 只差 +{dist_res:.1f}% ({out_badge})\n"
+                              f"• {code} {name}{flag}{squeeze_tag}：收 {close_p} ({chg_str}) | {val_yi:.1f}億\n"
+                              f"  👉 離頂 {res_p} 差 +{dist_res:.1f}% ({out_badge})\n"
+                              f"  👉 {ev_str} | {p95_str}\n"
                               f"  👉 {ma5_str} | {vwap_str} | 10日高 {h10_str}"
                           )
                           near_res.append((dist_res, block))
                       else:
                           dist_txt = f"距頂+{dist_res:.1f}%" if dist_res is not None else "距頂:NA"
-                          far_res.append(f"• {code} {name}{flag} {close_p} ({chg_str}) | {dist_txt} | {out_badge}")
+                          far_res.append(f"• {code} {name}{flag}{squeeze_tag} {close_p} ({chg_str}) | {dist_txt} | {ev_str}")
 
-                      print(f"✅ 完成 {code} {name} (資料日: {latest_day or q_date})")
+                      print(f"✅ 完成 {code} {name} | {ev_str}")
 
                   except FugleAPIError as e:
                       print(f"⚠️ [{code}] API 錯誤 ({e.status_code}): {e.response_text}")
@@ -247,22 +355,20 @@ jobs:
 
               near_res.sort(key=lambda x: x[0])
 
-              sections = [f"資料基準：{now_str} TW\n"]
-              if risk_lines:
-                  sections.append("【⚠️ 掃雷提醒】\n" + "\n".join(risk_lines) + "\n")
-              else:
-                  sections.append("【✅ 掃雷完成】無注意/處置股\n")
+              sections = [f"資料基準：{now_str} TW (42%低載/含扣稅EV)\n"]
+              sections.append(("【⚠️ 掃雷】\n" + "\n".join(risk_lines) + "\n") if risk_lines else "【✅ 掃雷】無注意/處置股\n")
 
               if over_res:
-                  sections.append("【⚠️ 舊頂已過時！週一記得調高】\n" + "\n".join(over_res) + "\n")
+                  sections.append("【⚠️ 舊頂過時！週一記得調高】\n" + "\n".join(over_res) + "\n")
               if near_res:
                   sections.append("【🔥 準備撞頂！距設定頂 ≤ 5%】\n" + "\n".join(b for _, b in near_res) + "\n")
               if far_res:
-                  sections.append("【💤 離頂較遠 (>5%)】\n" + "\n".join(far_res))
+                  sections.append("【💤 離頂較遠 (>5%)】\n" + "\n".join(far_res) + "\n")
 
-              # priority=4 為高優先；若想連手機「勿擾模式」都響鈴可改成 5
+              sections.append("【📋 週一建議清單(可直接貼回radar)】\n" + "\n".join(suggested_list))
+
               send_ntfy(
-                  title="📋 週一備戰地圖",
+                  title="📋 週一備戰與期望值地圖",
                   body="\n".join(sections),
                   priority=4,
                   tags=["clipboard", "chart_with_upwards_trend"],
