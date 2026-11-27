@@ -1,0 +1,31 @@
+name: TW Stock Intraday Radar
+
+on:
+  schedule:
+    # 台灣時間週一至週五 08:45 自動開機 (UTC 00:45)
+    - cron: '45 0 * * 1-5'
+  workflow_dispatch: # 支援手動按按鈕隨時測試開機
+
+jobs:
+  run-radar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # 允許最長跑 6 小時
+
+    steps:
+      - name: 下載專案代碼
+        uses: actions/checkout@v4
+
+      - name: 安裝 Python 環境
+        uses: setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝富果與網路套件
+        run: |
+          pip install fugle-marketdata requests
+
+      - name: 啟動機構級盯盤雷達
+        env:
+          FUGLE_API_KEY: ${{ secrets.FUGLE_API_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python stock_radar.py
