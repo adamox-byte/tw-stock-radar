@@ -1,1 +1,232 @@
+name: TW Stock Weekend & After-Hours Radar
 
+on:
+  schedule:
+    - cron: '0 1 * * 6'
+    - cron: '30 12 * * 0'
+  workflow_dispatch:
+
+concurrency:
+  group: tw-stock-weekend-radar
+  cancel-in-progress: true
+
+jobs:
+  run-weekend-briefing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 下載專案代碼
+        uses: actions/checkout@v4
+
+      - name: 安裝 Python 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝富果與網路套件
+        run: |
+          pip install fugle-marketdata requests tzdata
+
+      - name: 啟動週末復盤與週一備戰簡報
+        env:
+          FUGLE_API_KEY: ${{ secrets.FUGLE_API_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          cat << 'EOF' > run_weekend.py
+          import os
+          import time
+          import requests
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+          from fugle_marketdata import RestClient, FugleAPIError
+
+          TW_TZ = ZoneInfo("Asia/Taipei")
+
+          env_topic = os.environ.get("NTFY_TOPIC", "").strip()
+          NTFY_TOPIC = env_topic if env_topic else "my_tw_stock_k82m"
+          FUGLE_API_KEY = os.environ.get("FUGLE_API_KEY", "").strip()
+
+          watchlist = [
+              ("2606", "裕民", 68.0),
+              ("1795", "美時", 102.0),
+              ("2882", "國泰金", 105.5),
+              ("1326", "台化", 63.0),
+              ("3131", "弘塑", 1460.0),
+              ("1312", "國喬", 10.3),
+              ("1101", "台泥", 25.3),
+          ]
+
+          REST_MIN_INTERVAL = 2.4
+          _last_call_ts = 0.0
+
+          def safe_call(func, *args, **kwargs):
+              global _last_call_ts
+              wait = REST_MIN_INTERVAL - (time.monotonic() - _last_call_ts)
+              if wait > 0:
+                  time.sleep(wait)
+              try:
+                  res = func(*args, **kwargs)
+                  _last_call_ts = time.monotonic()
+                  return res
+              except FugleAPIError as e:
+                  _last_call_ts = time.monotonic()
+                  if e.status_code == 429:
+                      print("⚠️ 收到 HTTP 429，強制全域冷卻 65 秒...")
+                      time.sleep(65)
+                  raise
+
+          def send_ntfy(title: str, body: str, priority: int = 3, tags=None):
+              lines = body.splitlines()
+              chunks, buf, buf_bytes = [], [], 0
+              for line in lines:
+                  lb = len((line + "\n").encode("utf-8"))
+                  if buf and buf_bytes + lb > 2800:
+                      chunks.append("\n".join(buf))
+                      buf, buf_bytes = [line], lb
+                  else:
+                      buf.append(line)
+                      buf_bytes += lb
+              if buf:
+                  chunks.append("\n".join(buf))
+
+              total = len(chunks)
+              for idx, chunk in enumerate(chunks, start=1):
+                  part_title = f"{title} ({idx}/{total})" if total > 1 else title
+                  try:
+                      resp = requests.post(
+                          "https://ntfy.sh/",
+                          json={
+                              "topic": NTFY_TOPIC,
+                              "title": part_title,
+                              "message": chunk,
+                              "priority": priority,
+                              "tags": tags or ["bar_chart"],
+                          },
+                          timeout=8,
+                      )
+                      print(f"📡 推播 ({idx}/{total}) HTTP {resp.status_code} | 頻道: {NTFY_TOPIC}")
+                  except Exception as e:
+                      print(f"⚠️ 推播異常 ({idx}/{total}): {e}")
+                  if idx < total:
+                      time.sleep(1.5)
+
+          def get_risk_sets(stock_api):
+              attention_set, disposition_set = set(), set()
+              try:
+                  res_att = safe_call(stock_api.intraday.tickers, type="EQUITY", isAttention=True)
+                  attention_set = {item["symbol"] for item in res_att.get("data", []) if "symbol" in item}
+              except FugleAPIError as e:
+                  print(f"⚠️ 取得注意股清單失敗 ({e.status_code}): {e.response_text}")
+              except Exception as e:
+                  print(f"⚠️ 取得注意股清單失敗: {e}")
+
+              try:
+                  res_dis = safe_call(stock_api.intraday.tickers, type="EQUITY", isDisposition=True)
+                  disposition_set = {item["symbol"] for item in res_dis.get("data", []) if "symbol" in item}
+              except FugleAPIError as e:
+                  print(f"⚠️ 取得處置股清單失敗 ({e.status_code}): {e.response_text}")
+              except Exception as e:
+                  print(f"⚠️ 取得處置股清單失敗: {e}")
+
+              return attention_set, disposition_set
+
+          def main():
+              if not FUGLE_API_KEY:
+                  send_ntfy("❌ 週末戰情腳本異常", "未偵測到 FUGLE_API_KEY，請檢查 GitHub Secrets！", priority=4, tags=["warning"])
+                  raise ValueError("❌ 未設定 FUGLE_API_KEY")
+
+              now_tw = datetime.now(TW_TZ)
+              now_str = now_tw.strftime("%Y-%m-%d %H:%M")
+              from_date = (now_tw.date() - timedelta(days=25)).strftime("%Y-%m-%d")
+              to_date = now_tw.date().strftime("%Y-%m-%d")
+
+              print(f"🚀 啟動週末/盤後戰情分析 ({now_str} TW)...")
+              client = RestClient(api_key=FUGLE_API_KEY)
+              stock_api = client.stock
+
+              attention_set, disposition_set = get_risk_sets(stock_api)
+              risk_lines = []
+              stock_lines = []
+
+              for code, name_cfg, res_p in watchlist:
+                  try:
+                      stats = safe_call(stock_api.historical.stats, symbol=code)
+                      name = stats.get("name") or name_cfg
+                      close_p = stats.get("closePrice")
+                      chg_pct = stats.get("changePercent")
+                      high_52w = stats.get("week52High")
+                      val_yi = (stats.get("tradeValue") or 0) / 1e8
+
+                      candles = safe_call(
+                          stock_api.historical.candles,
+                          symbol=code,
+                          **{"from": from_date, "to": to_date, "timeframe": "D"},
+                      )
+                      valid_days = [d for d in candles.get("data", []) if d.get("close") is not None]
+                      latest_day = valid_days[0].get("date", "") if valid_days else ""
+
+                      if close_p is None and valid_days:
+                          close_p = valid_days[0]["close"]
+
+                      ma5 = sum(d["close"] for d in valid_days[:5]) / 5 if len(valid_days) >= 5 else None
+                      high_10d = max((d["high"] for d in valid_days[:10] if d.get("high") is not None), default=None)
+
+                      q = safe_call(stock_api.intraday.quote, symbol=code)
+                      q_date = q.get("date", "")
+                      vwap = None
+                      outer_pct = None
+                      if q_date and (not latest_day or q_date == latest_day):
+                          vwap = q.get("avgPrice")
+                          total = q.get("total") or {}
+                          ask_v = float(total.get("tradeVolumeAtAsk") or 0)
+                          bid_v = float(total.get("tradeVolumeAtBid") or 0)
+                          if (ask_v + bid_v) > 0:
+                              outer_pct = (ask_v / (ask_v + bid_v)) * 100
+
+                      flag = ""
+                      if code in disposition_set:
+                          flag = " 🚫處置"
+                          risk_lines.append(f"🚫 {code} {name}（處置股）")
+                      elif code in attention_set:
+                          flag = " ⚠️注意"
+                          risk_lines.append(f"⚠️ {code} {name}（注意股）")
+
+                      chg_str = f"{chg_pct:+.2f}%" if chg_pct is not None else "NA"
+                      ma5_str = ("✅5MA" if close_p >= ma5 else "❌破5MA") if (close_p and ma5) else "NA"
+                      vwap_str = ("✅VWAP" if close_p >= vwap else "❌破VWAP") if (close_p and vwap) else "NA"
+                      out_str = f"{outer_pct:.1f}%" if outer_pct is not None else "NA"
+                      dist_res = ((res_p - close_p) / close_p * 100) if (close_p and res_p) else None
+                      res_str = f"{res_p}({dist_res:+.1f}%)" if dist_res is not None else f"{res_p}"
+                      h10_str = f"{high_10d}" if high_10d is not None else "NA"
+                      h52_str = f"{high_52w}" if high_52w is not None else "NA"
+
+                      line = (
+                          f"• {code} {name}{flag}：收 {close_p} ({chg_str}) | {val_yi:.1f}億\n"
+                          f"  位階：{ma5_str} / {vwap_str} | 外盤：{out_str}\n"
+                          f"  參考：設頂 {res_str} | 10日高 {h10_str} | 52W高 {h52_str}"
+                      )
+                      stock_lines.append(line)
+                      print(f"✅ 完成 {code} {name} (資料日: {latest_day or q_date})")
+
+                  except FugleAPIError as e:
+                      print(f"⚠️ [{code}] API 錯誤 ({e.status_code}): {e.response_text}")
+                      stock_lines.append(f"• {code} {name_cfg}：API 錯誤 ({e.status_code})")
+                  except Exception as e:
+                      print(f"⚠️ [{code}] 例外錯誤: {e}")
+                      stock_lines.append(f"• {code} {name_cfg}：讀取異常")
+
+              risk_header = "【⚠️ 掃雷提醒】\n" + "\n".join(risk_lines) if risk_lines else "【✅ 掃雷完成】名單內目前無注意/處置股"
+              body = f"資料基準：{now_str} TW（42%低載模式）\n\n{risk_header}\n\n【📊 自選股週報與週一箱頂參考】\n" + "\n".join(stock_lines)
+
+              send_ntfy(
+                  title="📋 台股戰情週報與週一備戰",
+                  body=body,
+                  priority=4 if risk_lines else 3,
+                  tags=["clipboard", "chart_with_upwards_trend"],
+              )
+
+          if __name__ == "__main__":
+              main()
+          EOF
+          python -u run_weekend.py
